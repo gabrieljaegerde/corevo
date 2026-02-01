@@ -39,6 +39,7 @@ Each member casts their vote by submitting a commitment
 1. generate an individual *one-time salt* 
 2. compute the commitment as `hash(vote || one_time_salt || common_salt)`
 3. submit a system.remark with the commitment and the *context*
+   * our goal is that nothing except the seed phrase must be remembered locally, therefore we attach the vote itself to the commitment, encrypted to self. 
 
 ### Reveal Phase
 
@@ -57,14 +58,15 @@ For each member's last submitted commitment, guess the vote by trying all possib
 
 ## Auditability
 
-A group can decide to reveal their votes to an auditor by sharing the *common salt* along with the *context* for all their ballots.
+A group can decide to reveal their votes to an auditor by sharing the *common salt* along with the *context* for all their ballots. 
+Knowing all account addresses of a group and the *common salt* for each proposal the auditor can reproduce everything from all onchain system.remarks.
 
-## Voting History
+## Indexing Voting History
 
 We use [litescan](https://github.com/pifragile/litescan) indexer which feeds into a mongodb. 
-This allows for fine-grained filtering in our queries as we prefix each remark with `0xcc00ee` followed by a version byte.
+This allows for fine-grained filtering in our queries as we prefix each remark with `0xcc00ee` directly followed by a version byte and the *context*.
 
-litescan mongodb query:
+example litescan mongodb query:
 `{method: "remark", "args.remark": { $regex: /^0xcc00ee/i }}`
 
 TODO: mongodb query in cli and counting all votes.
