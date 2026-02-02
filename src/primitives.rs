@@ -13,6 +13,10 @@ pub struct VotingAccount {
     pub x25519_secret: StaticSecret,
 }
 
+pub type Salt = [u8; 32];
+pub type Commitment = [u8; 32];
+pub type PublicKeyForEncryption = [u8; 32];
+
 // ensure backwards compatibility if we can migrate our message formats in the future
 #[derive(Encode, Decode, Debug, PartialEq, Eq, Clone)]
 pub enum CorevoRemark {
@@ -51,33 +55,48 @@ impl Decode for PrefixedCorevoRemark {
     }
 }
 
+#[derive(Encode, Decode, Debug, PartialEq, Eq, Clone, Hash)]
+pub enum CorevoContext {
+    Bytes(Vec<u8>),
+    String(String),
+}
+
+impl Display for CorevoContext {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CorevoContext::Bytes(bytes) => {
+                write!(f, "Bytes({})", hex_encode(bytes))
+            }
+            CorevoContext::String(s) => {
+                write!(f, "String({})", s)
+            }
+        }
+    }
+}
+
+
 #[derive(Encode, Decode, Debug, PartialEq, Eq, Clone)]
 pub struct CorevoRemarkV1 {
-    pub context: Vec<u8>,
+    pub context: CorevoContext,
     pub msg: CorevoMessage
 }
 
 impl Display for CorevoRemarkV1 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let context_str = if let Ok(str) = String::from_utf8(self.context.clone()) {
-            str
-        } else {
-            hex_encode(self.context.as_slice())
-        };
-        write!(f, "CorevoRemarkV1(context: {}, msg: {})", context_str, self.msg)
+        write!(f, "CorevoRemarkV1(context: {}, msg: {})", self.context, self.msg)
     }
 }
 
 #[derive(Encode, Decode, Debug, PartialEq, Eq, Clone)]
 pub enum CorevoMessage {
     /// tell the world your X25519 pubkey so anyone can send you encrypted messages
-    AnnounceOwnPubKey([u8; 32]),
+    AnnounceOwnPubKey(PublicKeyForEncryption),
     /// Invite a voter to participate and share an E2EE common salt for the group
     InviteVoter(AccountId32, Vec<u8>),
     /// Commit your salted vote hash and persist the [`CorevoVoteAndSalt`], encrypted to yourself
-    Commit([u8; 32], Vec<u8>),
+    Commit(Commitment, Vec<u8>),
     /// Reveal your indovidual salted for the vote you committed to
-    RevealOneTimeSalt([u8; 32]),
+    RevealOneTimeSalt(Salt),
 }
 
 impl Display for CorevoMessage {
@@ -101,11 +120,11 @@ impl Display for CorevoMessage {
 #[derive(Encode, Decode, Debug, PartialEq, Eq, Clone)]
 pub struct CorevoVoteAndSalt {
     pub vote: CorevoVote,
-    pub onetime_salt: [u8; 32]
+    pub onetime_salt: Salt
 }
 
 impl CorevoVoteAndSalt {
-    pub fn hash(&self, maybe_common_salt: Option<[u8; 32]>) -> [u8; 32] {
+    pub fn commit(&self, maybe_common_salt: Option<Salt>) -> Commitment {
         let mut hasher = Blake2b512::new();
         hasher.update(self.onetime_salt);
         if let Some(common_salt) = maybe_common_salt {

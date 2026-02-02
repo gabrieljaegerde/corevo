@@ -3,7 +3,7 @@ use subxt::OnlineClient;
 use subxt::utils::{AccountId32, MultiAddress};
 use subxt_signer::sr25519::Keypair;
 use crate::{assethub, AssetHubConfig};
-use crate::primitives::{CorevoMessage, CorevoRemark, PrefixedCorevoRemark};
+use crate::primitives::{CorevoRemark, PrefixedCorevoRemark};
 
 pub async fn listen_to_blocks(api: OnlineClient<AssetHubConfig>) -> Result<(), Box<dyn std::error::Error>> {
     let mut blocks = api.blocks().subscribe_finalized().await?;
@@ -19,6 +19,7 @@ pub async fn listen_to_blocks(api: OnlineClient<AssetHubConfig>) -> Result<(), B
                     }
                 }
                 if let Ok(corevo_remark) = PrefixedCorevoRemark::decode(&mut remark.remark.as_slice()) {
+                    #[allow(irrefutable_let_patterns)]
                     if let CorevoRemark::V1(corevo_remark_v1) = corevo_remark.0 {
                         println!("⛓    CorevoV1 remark {}", corevo_remark_v1);
                     } else {

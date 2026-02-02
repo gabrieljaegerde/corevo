@@ -14,6 +14,7 @@ use subxt::{
 use rand::random;
 use codec::Encode;
 use futures::future::join_all;
+use crate::primitives::{CorevoContext, Salt};
 
 // [subxt::subxt(runtime_metadata_path = "paseo_people_metadata.scale")]
 #[subxt::subxt(runtime_metadata_path = "kusama_asset_hub_metadata.scale")]
@@ -29,6 +30,7 @@ const CONTEXT: &str = "corevo_test_voting";
 
 #[tokio::main]
 pub async fn main() {
+    env_logger::init();
     if let Err(err) = run().await {
         eprintln!("{err}");
     }
@@ -61,7 +63,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let _ = join_all(everybody.iter().map(|signer|
         send_remark(&api, &signer.sr25519_keypair,
                     CorevoRemark::V1(CorevoRemarkV1 {
-                        context: CONTEXT.as_bytes().to_vec(),
+                        context: CorevoContext::String(CONTEXT.into()),
                         msg: CorevoMessage::AnnounceOwnPubKey(signer.x25519_public.to_bytes())
                     }).into()))).await;
     println!("*********** INVITE PHASE **************" );
@@ -75,7 +77,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // send encrypted common salt to everybody else (and self, for persistence). Send sequentially to avoid nonce race.
     for account in everybody.clone() {
         send_remark(&api, &proposer.sr25519_keypair, CorevoRemark::V1(CorevoRemarkV1 {
-            context: CONTEXT.as_bytes().to_vec(),
+            context: CorevoContext::String(CONTEXT.into()),
             msg: CorevoMessage::InviteVoter(
                 account.sr25519_keypair.public_key().to_account_id(),
                 encrypt_for_recipient(&proposer.x25519_secret, &account.x25519_public, &common_salt.into()).unwrap()
@@ -88,10 +90,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Every voter publishes their commitment
     let _ = join_all(everybody.clone().iter().map(|signer| {
         let vote = CorevoVote::Aye;
-        let onetime_salt = random::<[u8; 32]>();
+        let onetime_salt = random::<Salt>();
         let vote_and_salt = CorevoVoteAndSalt { vote, onetime_salt };
         everybody_votes.insert(signer.sr25519_keypair.public_key().0, vote_and_salt.clone());
-        let commitment = vote_and_salt.hash(Some(common_salt));
+        let commitment = vote_and_salt.commit(Some(common_salt));
         println!("🗳 Voter {} commits to vote {:?} with onetime_salt 0x{} resulting in commitment 0x{}",
             signer.sr25519_keypair.public_key().to_account_id(),
             vote,
@@ -100,7 +102,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
         send_remark(&api, &signer.sr25519_keypair,
                     CorevoRemark::V1(CorevoRemarkV1 {
-                        context: CONTEXT.as_bytes().to_vec(),
+                        context: CorevoContext::String(CONTEXT.into()),
                         msg: CorevoMessage::Commit(commitment,
                         encrypt_for_recipient(&signer.x25519_secret, &signer.x25519_public,
                             &vote_and_salt.encode()).unwrap_or_default())
@@ -113,7 +115,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let vote_and_salt = everybody_votes.get(&signer.sr25519_keypair.public_key().0).unwrap();
         send_remark(&api, &signer.sr25519_keypair,
                     CorevoRemark::V1(CorevoRemarkV1 {
-                        context: CONTEXT.as_bytes().to_vec(),
+                        context: CorevoContext::String(CONTEXT.into()),
                         msg: CorevoMessage::RevealOneTimeSalt(vote_and_salt.onetime_salt)
                     }).into())
     })).await;
