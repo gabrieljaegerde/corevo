@@ -746,6 +746,8 @@ dependencies = [
  "env_logger",
  "futures",
  "log",
+ "mongodb",
+ "parity-scale-codec",
  "rand 0.8.5",
  "ratatui",
  "serde",

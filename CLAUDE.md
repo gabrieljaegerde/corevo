@@ -4,6 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
+
+
 CoReVo (Commit-Reveal-Voting) is a Rust CLI tool for implementing confidential group voting on Substrate-based blockchains using only `System.Remark` extrinsics. It enables secret ballot voting where votes remain private until revealed, preventing vote influence within groups.
 
 ## Build Commands

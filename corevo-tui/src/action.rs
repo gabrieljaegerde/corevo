@@ -52,7 +52,18 @@ pub enum Action {
     // Voting actions
     StartVoting(CorevoContext),
     CastVote(corevo_lib::CorevoVote),
+    CommitVote(corevo_lib::CorevoVote),
+    CommitVoteResult(Result<(), String>),
+    ShowRevealConfirm,
+    CancelReveal,
+    ConfirmReveal,
+    RevealVoteResult(Result<(), String>),
     VoteCast(Result<(), String>),
+
+    // Announce pubkey
+    AnnouncePubkey,
+    AnnouncePubkeyResult(Result<(), String>),
+    ClearAnnounceState,
 
     // Propose context actions
     ProposeContext,
@@ -70,4 +81,9 @@ pub enum Action {
 
     // Mouse
     RecordClick(u16, u16), // row, col
+
+    // Clipboard
+    CopyAddress(String),
+    CopiedFeedback,
+    ClearCopiedFeedback,
 }

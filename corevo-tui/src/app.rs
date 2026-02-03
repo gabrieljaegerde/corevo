@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use corevo_lib::{Config, CorevoContext, VotingHistory, derive_address_from_uri, ss58_prefix_for_chain, format_balance, token_info_for_chain, PublicKeyForEncryption, HashableAccountId};
+use corevo_lib::{AccountId32, Config, CorevoContext, VotingHistory, VoteStatus, ss58_prefix_for_chain, format_balance, token_info_for_chain, PublicKeyForEncryption, HashableAccountId};
 use tokio::sync::mpsc;
 
 use crate::action::Action;
@@ -46,6 +46,9 @@ pub struct App {
     /// Derived SS58 address from secret_uri (with chain-appropriate prefix)
     pub derived_address: Option<String>,
 
+    /// Cached account ID derived from secret_uri (to avoid re-deriving on every render)
+    pub current_account_id: Option<AccountId32>,
+
     /// Account balance in native tokens (raw, without decimals applied)
     pub balance: Option<u128>,
 
@@ -73,6 +76,15 @@ pub struct App {
     /// Loading state for available voters
     pub voters_loading: LoadingState,
 
+    /// Loading state for vote commit/reveal operations
+    pub voting_loading: LoadingState,
+
+    /// Loading state for pubkey announcement
+    pub announce_loading: LoadingState,
+
+    /// Whether to show the reveal confirmation dialog
+    pub show_reveal_confirm: bool,
+
     /// Error message to display
     pub error_message: Option<String>,
 
@@ -81,6 +93,9 @@ pub struct App {
 
     /// Last click time and position for double-click detection
     pub last_click: Option<(Instant, u16, u16)>,
+
+    /// Show "Copied!" feedback (with timestamp for auto-clear)
+    pub copied_feedback: Option<Instant>,
 }
 
 /// Editable config form fields
@@ -136,6 +151,7 @@ impl App {
             config_form,
             secret_uri: String::new(),
             derived_address: None,
+            current_account_id: None,
             balance: None,
             balance_loading: LoadingState::Idle,
             history: None,
@@ -145,31 +161,81 @@ impl App {
             propose_form: ProposeForm::default(),
             propose_loading: LoadingState::Idle,
             voters_loading: LoadingState::Idle,
+            voting_loading: LoadingState::Idle,
+            announce_loading: LoadingState::Idle,
+            show_reveal_confirm: false,
             error_message: None,
             action_tx,
             last_click: None,
+            copied_feedback: None,
         }
     }
 
-    /// Try to derive the SS58 address from the current secret_uri
+    /// Try to derive the SS58 address and account ID from the current secret_uri
     fn update_derived_address(&mut self) {
+        // Check if this is actually a different account
+        let old_account_id = self.current_account_id.clone();
+
         // Reset balance when address changes
         self.balance = None;
         self.balance_loading = LoadingState::Idle;
 
         if self.secret_uri.is_empty() {
             self.derived_address = None;
+            self.current_account_id = None;
         } else {
             let prefix = ss58_prefix_for_chain(&self.config_form.chain_url);
-            match derive_address_from_uri(&self.secret_uri, prefix) {
-                Ok(addr) => {
-                    self.derived_address = Some(addr);
+            match corevo_lib::derive_account_from_uri(&self.secret_uri) {
+                Ok(account) => {
+                    let account_id = account.sr25519_keypair.public_key().to_account_id();
+                    self.derived_address = Some(corevo_lib::format_account_ss58(&account_id, prefix));
+                    self.current_account_id = Some(account_id);
                     // Trigger balance load
                     let _ = self.action_tx.send(Action::LoadBalance);
                 }
-                Err(_) => self.derived_address = None,
+                Err(_) => {
+                    self.derived_address = None;
+                    self.current_account_id = None;
+                }
             }
         }
+
+        // If account changed, reset account-specific state
+        if old_account_id != self.current_account_id {
+            self.reset_account_state();
+        }
+    }
+
+    /// Reset all account-specific state (history, votes, etc.)
+    /// Called when switching accounts
+    fn reset_account_state(&mut self) {
+        // Preserve voter pubkey announcements by extracting them
+        let voter_pubkeys = self.history.as_ref().map(|h| h.voter_pubkeys.clone());
+
+        // Clear history and reload to get fresh data for new account
+        self.history = None;
+        self.history_loading = LoadingState::Idle;
+
+        // If we have pubkeys, create a minimal history with just pubkeys
+        // (actual vote history will be reloaded when user visits History/Vote screens)
+        if let Some(pubkeys) = voter_pubkeys {
+            use std::collections::HashMap;
+            self.history = Some(corevo_lib::VotingHistory {
+                contexts: HashMap::new(),
+                voter_pubkeys: pubkeys,
+            });
+        }
+
+        // Clear voting state
+        self.selected_context = None;
+        self.voting_loading = LoadingState::Idle;
+        self.show_reveal_confirm = false;
+
+        // Clear announce state
+        self.announce_loading = LoadingState::Idle;
+
+        // Reset selection
+        self.selected_index = 0;
     }
 
     /// Get formatted balance string with token symbol
@@ -187,6 +253,8 @@ impl App {
             Action::NavigateHome => {
                 self.screen = Screen::Home;
                 self.selected_index = 0;
+                self.show_reveal_confirm = false;
+                self.voting_loading = LoadingState::Idle;
             }
             Action::NavigateHistory => {
                 self.screen = Screen::History;
@@ -198,6 +266,11 @@ impl App {
             }
             Action::NavigateVoting => {
                 self.screen = Screen::Voting;
+                self.selected_index = 0;
+                // Auto-load history when navigating to voting if not already loaded
+                if self.history.is_none() && self.history_loading == LoadingState::Idle && !self.secret_uri.is_empty() {
+                    let _ = self.action_tx.send(Action::LoadHistory);
+                }
             }
             Action::NavigateConfig => {
                 self.screen = Screen::Config;
@@ -276,6 +349,9 @@ impl App {
             },
             Action::SelectContext(ctx) => {
                 self.selected_context = ctx;
+                self.selected_index = 0; // Reset selection when context changes
+                self.show_reveal_confirm = false;
+                self.voting_loading = LoadingState::Idle;
             }
 
             // Balance
@@ -325,6 +401,27 @@ impl App {
                 } else {
                     self.config_form.focused_field -= 1;
                 }
+            }
+
+            // Announce pubkey
+            Action::AnnouncePubkey => {
+                self.announce_loading = LoadingState::Loading;
+            }
+            Action::AnnouncePubkeyResult(result) => {
+                match result {
+                    Ok(()) => {
+                        self.announce_loading = LoadingState::Loaded;
+                        // Reload history to see updated pubkey status
+                        self.history_loading = LoadingState::Idle;
+                        let _ = self.action_tx.send(Action::LoadHistory);
+                    }
+                    Err(e) => {
+                        self.announce_loading = LoadingState::Error(e);
+                    }
+                }
+            }
+            Action::ClearAnnounceState => {
+                self.announce_loading = LoadingState::Idle;
             }
 
             // Propose context actions
@@ -526,7 +623,46 @@ impl App {
                 self.screen = Screen::Voting;
             }
             Action::CastVote(_vote) => {
-                // Handle vote casting
+                // Legacy - not used directly anymore
+            }
+            Action::CommitVote(_vote) => {
+                self.voting_loading = LoadingState::Loading;
+            }
+            Action::CommitVoteResult(result) => {
+                match result {
+                    Ok(()) => {
+                        self.voting_loading = LoadingState::Loaded;
+                        // Reload history to see updated vote status
+                        self.history_loading = LoadingState::Idle;
+                        let _ = self.action_tx.send(Action::LoadHistory);
+                    }
+                    Err(e) => {
+                        self.voting_loading = LoadingState::Error(e);
+                    }
+                }
+            }
+            Action::ShowRevealConfirm => {
+                self.show_reveal_confirm = true;
+            }
+            Action::CancelReveal => {
+                self.show_reveal_confirm = false;
+            }
+            Action::ConfirmReveal => {
+                self.show_reveal_confirm = false;
+                self.voting_loading = LoadingState::Loading;
+            }
+            Action::RevealVoteResult(result) => {
+                match result {
+                    Ok(()) => {
+                        self.voting_loading = LoadingState::Loaded;
+                        // Reload history to see updated vote status
+                        self.history_loading = LoadingState::Idle;
+                        let _ = self.action_tx.send(Action::LoadHistory);
+                    }
+                    Err(e) => {
+                        self.voting_loading = LoadingState::Error(e);
+                    }
+                }
             }
             Action::VoteCast(result) => {
                 if let Err(e) = result {
@@ -546,6 +682,24 @@ impl App {
             Action::RecordClick(row, col) => {
                 self.last_click = Some((Instant::now(), row, col));
             }
+
+            // Clipboard
+            Action::CopyAddress(address) => {
+                // Try external clipboard tools first (more reliable on Linux)
+                let copied = Self::copy_to_clipboard_external(&address)
+                    .or_else(|| Self::copy_to_clipboard_arboard(&address))
+                    .unwrap_or(false);
+
+                if copied {
+                    self.copied_feedback = Some(Instant::now());
+                }
+            }
+            Action::CopiedFeedback => {
+                self.copied_feedback = Some(Instant::now());
+            }
+            Action::ClearCopiedFeedback => {
+                self.copied_feedback = None;
+            }
         }
     }
 
@@ -563,13 +717,20 @@ impl App {
     /// Get the length of the current list based on screen
     pub fn get_list_length(&self) -> usize {
         match self.screen {
-            Screen::Home => 5, // Menu items (History, Voting, Propose, Config, Quit)
+            Screen::Home => 6, // Menu items (History, Voting, Propose, Config, Announce, Quit)
             Screen::History => self
                 .history
                 .as_ref()
                 .map(|h| h.contexts.len())
                 .unwrap_or(0),
-            Screen::Voting => 3, // Aye, Nay, Abstain
+            Screen::Voting => {
+                if self.selected_context.is_some() {
+                    3 // Aye, Nay, Abstain
+                } else {
+                    // Number of pending vote contexts
+                    self.get_pending_vote_contexts().len()
+                }
+            }
             Screen::Config => 4, // Form fields
             Screen::Propose => 2 + self.propose_form.available_voters.len(), // Context name + voters + button
         }
@@ -590,5 +751,228 @@ impl App {
             .iter()
             .filter(|v| v.selected)
             .collect()
+    }
+
+    /// Get the current user's AccountId32 (cached, not re-derived on each call)
+    pub fn get_current_account_id(&self) -> Option<&AccountId32> {
+        self.current_account_id.as_ref()
+    }
+
+    /// Get contexts where the current user has pending action (need to commit or reveal)
+    pub fn get_pending_vote_contexts(&self) -> Vec<&CorevoContext> {
+        let Some(account_id) = self.get_current_account_id() else {
+            return vec![];
+        };
+        let hashable_account_id = HashableAccountId::from(account_id.clone());
+
+        let Some(history) = &self.history else {
+            return vec![];
+        };
+
+        history
+            .contexts
+            .iter()
+            .filter_map(|(ctx, summary)| {
+                // Check if user is invited (in voters set)
+                if !summary.voters.contains(&hashable_account_id) {
+                    return None;
+                }
+
+                // Include contexts where user still has action to take
+                match summary.votes.get(&hashable_account_id) {
+                    None => Some(ctx),                       // Need to commit
+                    Some(VoteStatus::Committed(_)) => Some(ctx), // Need to reveal
+                    Some(VoteStatus::Revealed(_)) => None,   // Already revealed - done
+                    Some(VoteStatus::RevealedWithoutCommitment) => None, // Invalid state
+                }
+            })
+            .collect()
+    }
+
+    /// Get the current user's vote status for the selected context
+    pub fn get_current_vote_status(&self) -> Option<&VoteStatus> {
+        let account_id = self.get_current_account_id()?.clone();
+        let hashable_account_id = HashableAccountId::from(account_id);
+        let ctx = self.selected_context.as_ref()?;
+        let history = self.history.as_ref()?;
+        let summary = history.contexts.get(ctx)?;
+        summary.votes.get(&hashable_account_id)
+    }
+
+    /// Get the context summary for the selected context
+    pub fn get_selected_context_summary(&self) -> Option<&corevo_lib::ContextSummary> {
+        let ctx = self.selected_context.as_ref()?;
+        let history = self.history.as_ref()?;
+        history.contexts.get(ctx)
+    }
+
+    /// Check if the current user has announced their X25519 public key
+    pub fn has_announced_pubkey(&self) -> Option<bool> {
+        let account_id = self.get_current_account_id()?;
+        let history = self.history.as_ref()?;
+        let hashable = HashableAccountId::from(account_id.clone());
+        Some(history.voter_pubkeys.contains_key(&hashable))
+    }
+
+    /// Get the current user's announced X25519 public key if available
+    pub fn get_announced_pubkey(&self) -> Option<&corevo_lib::PublicKeyForEncryption> {
+        let account_id = self.get_current_account_id()?;
+        let history = self.history.as_ref()?;
+        let hashable = HashableAccountId::from(account_id.clone());
+        history.voter_pubkeys.get(&hashable)
+    }
+
+    /// Check if the account is usable on chain (has balance > 0)
+    /// Returns None if status is unknown (still loading), Some(true) if usable, Some(false) if not
+    pub fn is_account_on_chain(&self) -> Option<bool> {
+        if self.derived_address.is_none() {
+            return Some(false); // No account configured
+        }
+
+        match &self.balance_loading {
+            LoadingState::Idle => None, // Not yet checked
+            LoadingState::Loading => None, // Still loading
+            LoadingState::Loaded => {
+                // Account exists if balance > 0
+                Some(self.balance.map(|b| b > 0).unwrap_or(false))
+            }
+            LoadingState::Error(_) => Some(false), // Error fetching = probably doesn't exist
+        }
+    }
+
+    /// Check if copied feedback should still be shown (within 2 seconds)
+    pub fn should_show_copied(&self) -> bool {
+        self.copied_feedback
+            .map(|t| t.elapsed().as_secs() < 2)
+            .unwrap_or(false)
+    }
+
+    /// Check if a home menu item is disabled
+    /// Items: 0=History, 1=Vote, 2=Propose, 3=Config, 4=Announce, 5=Quit
+    pub fn is_home_menu_item_disabled(&self, index: usize) -> bool {
+        let can_use_chain = self.is_account_on_chain() == Some(true);
+        let can_announce = can_use_chain && self.has_announced_pubkey() == Some(false);
+
+        match index {
+            0 => false, // History - always enabled
+            1 => !can_use_chain && self.derived_address.is_some(), // Vote
+            2 => !can_use_chain && self.derived_address.is_some(), // Propose
+            3 => false, // Config - always enabled
+            4 => !can_announce, // Announce
+            5 => false, // Quit - always enabled
+            _ => false,
+        }
+    }
+
+    /// Find next enabled home menu item (wrapping)
+    pub fn next_enabled_home_item(&self, current: usize) -> usize {
+        let total = 6;
+        for offset in 1..=total {
+            let next = (current + offset) % total;
+            if !self.is_home_menu_item_disabled(next) {
+                return next;
+            }
+        }
+        current // All disabled, stay put
+    }
+
+    /// Find previous enabled home menu item (wrapping)
+    pub fn prev_enabled_home_item(&self, current: usize) -> usize {
+        let total = 6;
+        for offset in 1..=total {
+            let prev = (current + total - offset) % total;
+            if !self.is_home_menu_item_disabled(prev) {
+                return prev;
+            }
+        }
+        current // All disabled, stay put
+    }
+
+    /// Try to copy text using external clipboard tools (xclip, xsel, wl-copy)
+    fn copy_to_clipboard_external(text: &str) -> Option<bool> {
+        use std::process::{Command, Stdio};
+        use std::io::Write;
+
+        // Try wl-copy first (Wayland)
+        if let Ok(mut child) = Command::new("wl-copy")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                if stdin.write_all(text.as_bytes()).is_ok() {
+                    drop(stdin);
+                    if child.wait().map(|s| s.success()).unwrap_or(false) {
+                        return Some(true);
+                    }
+                }
+            }
+        }
+
+        // Try xclip (X11)
+        if let Ok(mut child) = Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                if stdin.write_all(text.as_bytes()).is_ok() {
+                    drop(stdin);
+                    if child.wait().map(|s| s.success()).unwrap_or(false) {
+                        return Some(true);
+                    }
+                }
+            }
+        }
+
+        // Try xsel (X11 alternative)
+        if let Ok(mut child) = Command::new("xsel")
+            .args(["--clipboard", "--input"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                if stdin.write_all(text.as_bytes()).is_ok() {
+                    drop(stdin);
+                    if child.wait().map(|s| s.success()).unwrap_or(false) {
+                        return Some(true);
+                    }
+                }
+            }
+        }
+
+        None // No external tool worked
+    }
+
+    /// Fallback: try arboard (may not work well on Linux without persistence)
+    fn copy_to_clipboard_arboard(text: &str) -> Option<bool> {
+        // On Linux, spawn a thread to keep clipboard alive
+        #[cfg(target_os = "linux")]
+        {
+            let text = text.to_string();
+            std::thread::spawn(move || {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(&text);
+                    // Keep alive for paste operations
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                }
+            });
+            return Some(true);
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                if clipboard.set_text(text).is_ok() {
+                    return Some(true);
+                }
+            }
+            None
+        }
     }
 }

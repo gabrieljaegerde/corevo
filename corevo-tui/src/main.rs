@@ -107,6 +107,38 @@ async fn main() -> Result<()> {
                             let _ = tx.send(Action::VotersLoaded(result));
                         });
                     }
+                    Action::CommitVote(vote) => {
+                        let chain_url = app.config_form.chain_url.clone();
+                        let secret_uri = app.secret_uri.clone();
+                        let context = app.selected_context.clone();
+                        let config = app.config.clone();
+                        let vote = *vote;
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            let result = commit_vote(&chain_url, &secret_uri, context, vote, &config).await;
+                            let _ = tx.send(Action::CommitVoteResult(result));
+                        });
+                    }
+                    Action::ConfirmReveal => {
+                        let chain_url = app.config_form.chain_url.clone();
+                        let secret_uri = app.secret_uri.clone();
+                        let context = app.selected_context.clone();
+                        let config = app.config.clone();
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            let result = reveal_vote(&chain_url, &secret_uri, context, &config).await;
+                            let _ = tx.send(Action::RevealVoteResult(result));
+                        });
+                    }
+                    Action::AnnouncePubkey => {
+                        let chain_url = app.config_form.chain_url.clone();
+                        let secret_uri = app.secret_uri.clone();
+                        let tx = action_tx.clone();
+                        tokio::spawn(async move {
+                            let result = announce_pubkey(&chain_url, &secret_uri).await;
+                            let _ = tx.send(Action::AnnouncePubkeyResult(result));
+                        });
+                    }
                     _ => {}
                 }
 
@@ -158,21 +190,76 @@ fn handle_key_event(app: &App, key: KeyEvent) -> Option<Action> {
 }
 
 fn handle_home_keys(app: &App, key: KeyEvent) -> Option<Action> {
+    // If announce is loading/loaded/error, allow Esc to clear it
+    if !matches!(app.announce_loading, LoadingState::Idle) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Enter) {
+            return Some(Action::ClearAnnounceState);
+        }
+        return None; // Block other keys while popup is showing
+    }
+
+    // Check if account can perform on-chain actions
+    let can_use_chain = app.is_account_on_chain() == Some(true);
+    let can_announce = can_use_chain && app.has_announced_pubkey() == Some(false);
+
     match key.code {
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('1') => Some(Action::NavigateHistory),
-        KeyCode::Char('2') => Some(Action::NavigateVoting),
-        KeyCode::Char('3') => Some(Action::NavigatePropose),
+        KeyCode::Char('2') => {
+            if can_use_chain {
+                Some(Action::NavigateVoting)
+            } else {
+                None
+            }
+        }
+        KeyCode::Char('3') => {
+            if can_use_chain {
+                Some(Action::NavigatePropose)
+            } else {
+                None
+            }
+        }
         KeyCode::Char('4') => Some(Action::NavigateConfig),
-        KeyCode::Up | KeyCode::Char('k') => Some(Action::SelectPrev),
-        KeyCode::Down | KeyCode::Char('j') => Some(Action::SelectNext),
+        KeyCode::Char('5') => {
+            if can_announce {
+                Some(Action::AnnouncePubkey)
+            } else {
+                None
+            }
+        }
+        // Skip disabled items when navigating
+        KeyCode::Up | KeyCode::Char('k') => {
+            Some(Action::SelectIndex(app.prev_enabled_home_item(app.selected_index)))
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            Some(Action::SelectIndex(app.next_enabled_home_item(app.selected_index)))
+        }
         KeyCode::Enter => {
             match app.selected_index {
                 0 => Some(Action::NavigateHistory),
-                1 => Some(Action::NavigateVoting),
-                2 => Some(Action::NavigatePropose),
+                1 => {
+                    if can_use_chain {
+                        Some(Action::NavigateVoting)
+                    } else {
+                        None
+                    }
+                }
+                2 => {
+                    if can_use_chain {
+                        Some(Action::NavigatePropose)
+                    } else {
+                        None
+                    }
+                }
                 3 => Some(Action::NavigateConfig),
-                4 => Some(Action::Quit),
+                4 => {
+                    if can_announce {
+                        Some(Action::AnnouncePubkey)
+                    } else {
+                        None
+                    }
+                }
+                5 => Some(Action::Quit),
                 _ => None,
             }
         }
@@ -211,15 +298,109 @@ fn handle_history_keys(app: &App, key: KeyEvent) -> Option<Action> {
     }
 }
 
-fn handle_voting_keys(_app: &App, key: KeyEvent) -> Option<Action> {
-    match key.code {
-        KeyCode::Esc => Some(Action::NavigateHome),
-        KeyCode::Char('1') => Some(Action::CastVote(corevo_lib::CorevoVote::Aye)),
-        KeyCode::Char('2') => Some(Action::CastVote(corevo_lib::CorevoVote::Nay)),
-        KeyCode::Char('3') => Some(Action::CastVote(corevo_lib::CorevoVote::Abstain)),
-        KeyCode::Up | KeyCode::Char('k') => Some(Action::SelectPrev),
-        KeyCode::Down | KeyCode::Char('j') => Some(Action::SelectNext),
-        _ => None,
+fn handle_voting_keys(app: &App, key: KeyEvent) -> Option<Action> {
+    use corevo_lib::VoteStatus;
+
+    // If showing reveal confirmation dialog
+    if app.show_reveal_confirm {
+        return match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Action::ConfirmReveal),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Backspace => Some(Action::CancelReveal),
+            _ => None,
+        };
+    }
+
+    // If in loading state, allow Esc to go back
+    if matches!(app.voting_loading, LoadingState::Loading) {
+        return match key.code {
+            KeyCode::Esc => Some(Action::NavigateHome),
+            _ => None,
+        };
+    }
+
+    // If in error state, allow any key to clear and retry, or Esc/Backspace to go back
+    if matches!(app.voting_loading, LoadingState::Error(_)) {
+        return match key.code {
+            KeyCode::Esc => Some(Action::NavigateHome),
+            KeyCode::Backspace => Some(Action::SelectContext(None)),
+            _ => None, // Any other key could retry
+        };
+    }
+
+    // Different behavior based on whether a context is selected
+    if app.selected_context.is_some() {
+        // Check vote status to determine behavior
+        let vote_status = app.get_current_vote_status();
+
+        match vote_status {
+            None => {
+                // Not yet voted - can select and commit a vote
+                match key.code {
+                    KeyCode::Esc => Some(Action::NavigateHome),
+                    KeyCode::Backspace => Some(Action::SelectContext(None)),
+                    KeyCode::Char('1') => Some(Action::SelectIndex(0)),
+                    KeyCode::Char('2') => Some(Action::SelectIndex(1)),
+                    KeyCode::Char('3') => Some(Action::SelectIndex(2)),
+                    KeyCode::Up | KeyCode::Char('k') => Some(Action::SelectPrev),
+                    KeyCode::Down | KeyCode::Char('j') => Some(Action::SelectNext),
+                    KeyCode::Enter => {
+                        // Commit the selected vote
+                        let vote = match app.selected_index {
+                            0 => corevo_lib::CorevoVote::Aye,
+                            1 => corevo_lib::CorevoVote::Nay,
+                            _ => corevo_lib::CorevoVote::Abstain,
+                        };
+                        Some(Action::CommitVote(vote))
+                    }
+                    _ => None,
+                }
+            }
+            Some(VoteStatus::Committed(_)) => {
+                // Committed but not revealed - show reveal button
+                match key.code {
+                    KeyCode::Esc => Some(Action::NavigateHome),
+                    KeyCode::Backspace => Some(Action::SelectContext(None)),
+                    KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('R') => Some(Action::ShowRevealConfirm),
+                    _ => None,
+                }
+            }
+            Some(VoteStatus::Revealed(_)) | Some(VoteStatus::RevealedWithoutCommitment) => {
+                // Already revealed or invalid - can only go back
+                match key.code {
+                    KeyCode::Esc => Some(Action::NavigateHome),
+                    KeyCode::Backspace => Some(Action::SelectContext(None)),
+                    _ => None,
+                }
+            }
+        }
+    } else {
+        // No context selected - context selection mode
+        match key.code {
+            KeyCode::Esc => Some(Action::NavigateHome),
+            KeyCode::Backspace => Some(Action::NavigateHome),
+            KeyCode::Char('r') => Some(Action::LoadHistory), // Refresh
+            KeyCode::Enter => {
+                // Load history if not yet loaded
+                if app.history_loading == LoadingState::Idle {
+                    Some(Action::LoadHistory)
+                } else if app.history_loading == LoadingState::Loaded {
+                    // Select the highlighted context
+                    let pending = app.get_pending_vote_contexts();
+                    if let Some(ctx) = pending.get(app.selected_index) {
+                        Some(Action::SelectContext(Some((*ctx).clone())))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => Some(Action::SelectPrev),
+            KeyCode::Down | KeyCode::Char('j') => Some(Action::SelectNext),
+            KeyCode::PageUp => Some(Action::ScrollUp(10)),
+            KeyCode::PageDown => Some(Action::ScrollDown(10)),
+            _ => None,
+        }
     }
 }
 
@@ -356,9 +537,21 @@ fn handle_mouse_event(app: &App, mouse: MouseEvent) -> Vec<Action> {
         MouseEventKind::Down(MouseButton::Left) => {
             handle_mouse_click(app, mouse.row, mouse.column)
         }
-        // Scroll wheel navigation works everywhere
-        MouseEventKind::ScrollUp => vec![Action::SelectPrev],
-        MouseEventKind::ScrollDown => vec![Action::SelectNext],
+        // Scroll wheel navigation - skip disabled items on home screen
+        MouseEventKind::ScrollUp => {
+            if app.screen == Screen::Home {
+                vec![Action::SelectIndex(app.prev_enabled_home_item(app.selected_index))]
+            } else {
+                vec![Action::SelectPrev]
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.screen == Screen::Home {
+                vec![Action::SelectIndex(app.next_enabled_home_item(app.selected_index))]
+            } else {
+                vec![Action::SelectNext]
+            }
+        }
         _ => vec![],
     }
 }
@@ -370,21 +563,50 @@ fn handle_mouse_click(app: &App, row: u16, col: u16) -> Vec<Action> {
 
     match app.screen {
         Screen::Home => {
-            // Home screen layout: margin(2), title(3), info(9), menu starts at row 2+3+9=14
-            // Menu has border, so items start at row 15
-            // Items: History(0), Voting(1), Propose(2), Config(3), Quit(4)
-            let menu_start = 2 + 3 + 9 + 1; // margin + title + info + border
+            // Home screen layout: margin(2), title(3), info box(9), menu
+            // Info box starts at row 2+3 = 5 (with border at row 5, content starts at row 6)
+            // Account line is at row 5 + 1 (border) + 3 (chain, db, blank) = row 9
             let r = row as usize;
-            if r >= menu_start && r < menu_start + 5 {
+            let info_start = 2 + 3; // margin + title
+            let account_row = info_start + 1 + 3; // border + chain + db + blank
+
+            // Check if click is on account line (to copy address)
+            if r == account_row {
+                if let Some(ref address) = app.derived_address {
+                    actions.push(Action::CopyAddress(address.clone()));
+                    return actions;
+                }
+            }
+
+            // Menu starts after info box
+            let menu_start = 2 + 3 + 9 + 1; // margin + title + info + border
+            // Items: History(0), Voting(1), Propose(2), Config(3), Announce(4), Quit(5)
+            if r >= menu_start && r < menu_start + 6 {
                 let idx = r - menu_start;
+                let can_use_chain = app.is_account_on_chain() == Some(true);
+                let can_announce = can_use_chain && app.has_announced_pubkey() == Some(false);
+
                 if is_double {
-                    // Double-click: navigate directly
+                    // Double-click: navigate directly (respecting disabled states)
                     match idx {
                         0 => actions.push(Action::NavigateHistory),
-                        1 => actions.push(Action::NavigateVoting),
-                        2 => actions.push(Action::NavigatePropose),
+                        1 => {
+                            if can_use_chain {
+                                actions.push(Action::NavigateVoting);
+                            }
+                        }
+                        2 => {
+                            if can_use_chain {
+                                actions.push(Action::NavigatePropose);
+                            }
+                        }
                         3 => actions.push(Action::NavigateConfig),
-                        4 => actions.push(Action::Quit),
+                        4 => {
+                            if can_announce {
+                                actions.push(Action::AnnouncePubkey);
+                            }
+                        }
+                        5 => actions.push(Action::Quit),
                         _ => {}
                     }
                 } else {
@@ -394,11 +616,24 @@ fn handle_mouse_click(app: &App, row: u16, col: u16) -> Vec<Action> {
             }
         }
         Screen::History => {
-            // History layout: margin(1), title(3), content area
-            // Content area: list on left (40%) with border
-            // List items start at row: 1 + 3 + 1 (margin + title + list border) = 5
-            let list_start = 1 + 3 + 1;
+            // History layout: margin(1), title(3), account pane(6), content area
+            // Account pane starts at row 1+3 = 4 (with border, content at row 5)
+            // Address line is at row 4 + 1 = 5 (border + first line)
             let r = row as usize;
+            let account_pane_start = 1 + 3; // margin + title
+            let account_address_row = account_pane_start + 1; // border + content
+
+            // Check if click is on account address line (to copy)
+            if r == account_address_row {
+                if let Some(ref address) = app.derived_address {
+                    actions.push(Action::CopyAddress(address.clone()));
+                    return actions;
+                }
+            }
+
+            // Content area: list on left (40%) with border
+            // List items start at row: 1 + 3 + 6 + 1 (margin + title + account pane + list border) = 11
+            let list_start = 1 + 3 + 6 + 1;
             let max = app.get_list_length();
             if r >= list_start && max > 0 {
                 let idx = r - list_start;
@@ -408,10 +643,23 @@ fn handle_mouse_click(app: &App, row: u16, col: u16) -> Vec<Action> {
             }
         }
         Screen::Voting => {
-            // Voting layout: margin(1), title(3), context(6), vote options
+            // Voting layout: margin(1), title(3), status/context(6), vote options
+            // Status/context area: row 4-9 (with border at 4, content at 5)
+            // If in context selection mode, account line is at row 5
+            let r = row as usize;
+            let status_area_start = 1 + 3; // margin + title
+            let account_row = status_area_start + 1; // border + first content line
+
+            // Check if click is on account line (to copy) - only in context selection mode
+            if app.selected_context.is_none() && r == account_row {
+                if let Some(ref address) = app.derived_address {
+                    actions.push(Action::CopyAddress(address.clone()));
+                    return actions;
+                }
+            }
+
             // Vote options have border, items start at row: 1+3+6+1 = 11
             let options_start = 1 + 3 + 6 + 1;
-            let r = row as usize;
             if r >= options_start && r < options_start + 3 {
                 let idx = r - options_start;
                 actions.push(Action::SelectIndex(idx));
@@ -430,8 +678,25 @@ fn handle_mouse_click(app: &App, row: u16, col: u16) -> Vec<Action> {
             }
         }
         Screen::Propose => {
-            // Propose layout: margin(1), title(3), instructions(5), context field
-            // Clicking anywhere in the form area is fine (only one field)
+            // Propose layout: margin(1), title(3), context name(3), voter list(min 6), button(3), status(3), help(3)
+            // Voter list starts at row: 1 + 3 + 3 = 7, with border so content starts at row 8
+            let r = row as usize;
+            let voter_list_start = 1 + 3 + 3 + 1; // margin + title + context name + border
+
+            // Check if click is in the voter list area
+            let ss58_prefix = corevo_lib::ss58_prefix_for_chain(&app.config_form.chain_url);
+            if r >= voter_list_start && !app.propose_form.available_voters.is_empty() {
+                let voter_idx = r - voter_list_start;
+                if voter_idx < app.propose_form.available_voters.len() {
+                    // Get the voter's full address for copying
+                    let address = corevo_lib::format_account_ss58(
+                        &app.propose_form.available_voters[voter_idx].account_id.0,
+                        ss58_prefix
+                    );
+                    actions.push(Action::CopyAddress(address));
+                    return actions;
+                }
+            }
         }
     }
 
@@ -518,8 +783,16 @@ async fn propose_context(
     let account = derive_account_from_uri(secret_uri)
         .map_err(|e| e.to_string())?;
 
-    // Create the context
-    let context = CorevoContext::String(context_name.to_string());
+    // Create the context - use Bytes if hex string, otherwise String
+    let context = if context_name.starts_with("0x") || context_name.starts_with("0X") {
+        // Try to parse as hex using corevo_lib's decode_hex
+        match corevo_lib::primitives::decode_hex(context_name) {
+            Ok(bytes) => CorevoContext::Bytes(bytes),
+            Err(_) => CorevoContext::String(context_name.to_string()), // Fall back to string if invalid hex
+        }
+    } else {
+        CorevoContext::String(context_name.to_string())
+    };
 
     // Connect to chain
     let client = ChainClient::connect(chain_url)
@@ -560,6 +833,331 @@ async fn propose_context(
             .await
             .map_err(|e| format!("Failed to invite voter: {}", e))?;
     }
+
+    Ok(())
+}
+
+/// Async function to commit a vote to the chain
+async fn commit_vote(
+    chain_url: &str,
+    secret_uri: &str,
+    context: Option<corevo_lib::CorevoContext>,
+    vote: corevo_lib::CorevoVote,
+    config: &corevo_lib::Config,
+) -> Result<(), String> {
+    use codec::{Decode, Encode};
+    use corevo_lib::{
+        ChainClient, CorevoMessage, CorevoRemark, CorevoRemarkV1,
+        CorevoVoteAndSalt, HashableAccountId, HistoryQuery, PrefixedCorevoRemark,
+        derive_account_from_uri, decrypt_from_sender, encrypt_for_recipient,
+        format_account_ss58, ss58_prefix_for_chain,
+    };
+    #[allow(unused_imports)]
+    use corevo_lib::Salt;
+    use futures::TryStreamExt;
+    use mongodb::{
+        bson::{doc, Bson, Document},
+        options::ClientOptions,
+        Client,
+    };
+    use rand::{RngCore, thread_rng};
+    use x25519_dalek::PublicKey as X25519PublicKey;
+
+    let context = context.ok_or("No voting context selected")?;
+
+    // Derive account for signing and encryption
+    let account = derive_account_from_uri(secret_uri)
+        .map_err(|e| e.to_string())?;
+    let my_account_id = account.sr25519_keypair.public_key().to_account_id();
+
+    // First try: Query history to see if common salt is already decrypted (works if we're the proposer)
+    let account_for_query = derive_account_from_uri(secret_uri)
+        .map_err(|e| e.to_string())?;
+
+    let full_history = HistoryQuery::new(config)
+        .with_context(context.clone())
+        .with_known_accounts(vec![account_for_query])
+        .execute()
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let full_summary = full_history.contexts.get(&context)
+        .ok_or("Context not found in history")?;
+
+    // Try to get the common salt - might be empty if we're not the proposer
+    let common_salt: [u8; 32] = if let Some(salt) = full_summary.common_salts.first() {
+        *salt
+    } else {
+        // We're not the proposer - need to decrypt our invite manually
+        // Get the proposer's public key
+        let proposer_pubkey_bytes = full_history.voter_pubkeys
+            .get(&HashableAccountId::from(full_summary.proposer.clone()))
+            .ok_or("Proposer's public key not found")?;
+        let proposer_pubkey = X25519PublicKey::from(*proposer_pubkey_bytes);
+
+        // Query MongoDB to find the InviteVoter message for us
+        let ss58_prefix = ss58_prefix_for_chain(chain_url);
+        let my_ss58_address = format_account_ss58(&my_account_id, ss58_prefix);
+
+        let mut client_options: ClientOptions = ClientOptions::parse(&config.mongodb_uri)
+            .await
+            .map_err(|e: mongodb::error::Error| e.to_string())?;
+        client_options.app_name = Some("corevo-tui".to_string());
+        let mongo_client = Client::with_options(client_options)
+            .map_err(|e: mongodb::error::Error| e.to_string())?;
+
+        let db = mongo_client.database(&config.mongodb_db);
+        let coll = db.collection::<Document>("extrinsics");
+
+        // Query for InviteVoter messages in this context
+        let filter = doc! {
+            "method": "remark",
+            "args.remark": { "$regex": "^0xcc00ee", "$options": "i" },
+        };
+
+        let mut cursor = coll.find(filter)
+            .await
+            .map_err(|e: mongodb::error::Error| e.to_string())?;
+
+        let mut encrypted_salt: Option<Vec<u8>> = None;
+
+        while let Some(doc_result) = cursor.try_next().await.map_err(|e: mongodb::error::Error| e.to_string())? {
+            let remark = doc_result
+                .get_document("args")
+                .ok()
+                .and_then(|args: &Document| args.get("remark"))
+                .and_then(|v| match v {
+                    Bson::String(s) => Some(s.as_str()),
+                    _ => None,
+                });
+
+            let Some(remark_hex) = remark else { continue };
+            let Ok(remark_bytes) = corevo_lib::primitives::decode_hex(remark_hex) else { continue };
+            let Ok(prefixed) = PrefixedCorevoRemark::decode(&mut remark_bytes.as_slice()) else { continue };
+
+            #[allow(irrefutable_let_patterns)]
+            let CorevoRemark::V1(CorevoRemarkV1 { context: msg_ctx, msg }) = prefixed.0 else { continue };
+
+            // Check if this is for our context
+            if msg_ctx != context { continue }
+
+            // Check if this is an InviteVoter message for us
+            if let CorevoMessage::InviteVoter(voter_id, enc_salt) = msg {
+                // Check if this invite is for us (compare SS58 addresses)
+                let voter_ss58 = format_account_ss58(&voter_id, ss58_prefix);
+                if voter_ss58 == my_ss58_address {
+                    encrypted_salt = Some(enc_salt);
+                    break;
+                }
+            }
+        }
+
+        let encrypted_salt = encrypted_salt
+            .ok_or("No invite found for your account in this context")?;
+
+        // Decrypt the common salt using our secret + proposer's public key
+        let decrypted = decrypt_from_sender(
+            &account.x25519_secret,
+            &proposer_pubkey,
+            &encrypted_salt,
+        ).map_err(|e| format!("Failed to decrypt common salt: {}", e))?;
+
+        if decrypted.len() != 32 {
+            return Err("Decrypted salt has wrong length".to_string());
+        }
+
+        let mut salt = [0u8; 32];
+        salt.copy_from_slice(&decrypted);
+        salt
+    };
+
+    // Generate one-time salt for this vote
+    let mut onetime_salt = [0u8; 32];
+    thread_rng().fill_bytes(&mut onetime_salt);
+
+    // Create the vote+salt structure
+    let vote_and_salt = CorevoVoteAndSalt {
+        vote,
+        onetime_salt,
+    };
+
+    // Generate commitment hash
+    let commitment = vote_and_salt.commit(Some(common_salt));
+
+    // Encrypt vote+salt for self-recovery (using our own public key)
+    let vote_and_salt_bytes = vote_and_salt.encode();
+    let encrypted_vote_and_salt = encrypt_for_recipient(
+        &account.x25519_secret,
+        &account.x25519_public,
+        &vote_and_salt_bytes,
+    ).map_err(|e| format!("Failed to encrypt vote: {}", e))?;
+
+    // Connect to chain
+    let client = ChainClient::connect(chain_url)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Send the Commit message
+    let commit_msg = CorevoMessage::Commit(commitment, encrypted_vote_and_salt);
+    let commit_remark = PrefixedCorevoRemark::from(CorevoRemark::V1(CorevoRemarkV1 {
+        context,
+        msg: commit_msg,
+    }));
+
+    client.send_remark(&account.sr25519_keypair, commit_remark)
+        .await
+        .map_err(|e| format!("Failed to commit vote: {}", e))?;
+
+    Ok(())
+}
+
+/// Async function to reveal a vote on the chain
+async fn reveal_vote(
+    chain_url: &str,
+    secret_uri: &str,
+    context: Option<corevo_lib::CorevoContext>,
+    config: &corevo_lib::Config,
+) -> Result<(), String> {
+    use codec::Decode;
+    use corevo_lib::{
+        ChainClient, CorevoMessage, CorevoRemark, CorevoRemarkV1, CorevoVoteAndSalt,
+        PrefixedCorevoRemark, derive_account_from_uri, decrypt_from_sender,
+        format_account_ss58, ss58_prefix_for_chain,
+    };
+    use futures::TryStreamExt;
+    use mongodb::{
+        bson::{doc, Bson, Document},
+        options::ClientOptions,
+        Client,
+    };
+
+    let context = context.ok_or("No voting context selected")?;
+
+    // Derive account for signing and decryption
+    let account = derive_account_from_uri(secret_uri)
+        .map_err(|e| e.to_string())?;
+    let my_account_id = account.sr25519_keypair.public_key().to_account_id();
+
+    // Convert to SS58 format (that's how it's stored in MongoDB)
+    let ss58_prefix = ss58_prefix_for_chain(chain_url);
+    let my_ss58_address = format_account_ss58(&my_account_id, ss58_prefix);
+
+    // We need to get the encrypted_vote_and_salt from our own Commit message
+    // This requires querying MongoDB directly for our commit
+    let mut client_options: ClientOptions = ClientOptions::parse(&config.mongodb_uri)
+        .await
+        .map_err(|e: mongodb::error::Error| e.to_string())?;
+    client_options.app_name = Some("corevo-tui".to_string());
+    let mongo_client = Client::with_options(client_options)
+        .map_err(|e: mongodb::error::Error| e.to_string())?;
+
+    let db = mongo_client.database(&config.mongodb_db);
+    let coll = db.collection::<Document>("extrinsics");
+
+    // Query for our commit in this context (using SS58 address format)
+    let filter = doc! {
+        "method": "remark",
+        "args.remark": { "$regex": "^0xcc00ee", "$options": "i" },
+        "signer.Id": &my_ss58_address,
+    };
+
+    let mut cursor = coll.find(filter)
+        .await
+        .map_err(|e: mongodb::error::Error| e.to_string())?;
+
+    let mut encrypted_vote_and_salt: Option<Vec<u8>> = None;
+
+    // Find our Commit message for this context
+    while let Some(doc) = cursor.try_next().await.map_err(|e: mongodb::error::Error| e.to_string())? {
+        let remark = doc
+            .get_document("args")
+            .ok()
+            .and_then(|args: &Document| args.get("remark"))
+            .and_then(|v| match v {
+                Bson::String(s) => Some(s.as_str()),
+                _ => None,
+            });
+
+        let Some(remark_hex) = remark else { continue };
+        let Ok(remark_bytes) = corevo_lib::primitives::decode_hex(remark_hex) else { continue };
+        let Ok(prefixed) = PrefixedCorevoRemark::decode(&mut remark_bytes.as_slice()) else { continue };
+
+        #[allow(irrefutable_let_patterns)]
+        let CorevoRemark::V1(CorevoRemarkV1 { context: msg_ctx, msg }) = prefixed.0 else { continue };
+
+        // Check if this is for our context
+        if msg_ctx != context { continue }
+
+        // Check if this is a Commit message
+        if let CorevoMessage::Commit(_commitment, encrypted) = msg {
+            encrypted_vote_and_salt = Some(encrypted);
+            break;
+        }
+    }
+
+    let encrypted_vote_and_salt = encrypted_vote_and_salt
+        .ok_or("Your commit message was not found on chain")?;
+
+    // Decrypt the vote+salt using our own key
+    let decrypted = decrypt_from_sender(
+        &account.x25519_secret,
+        &account.x25519_public,
+        &encrypted_vote_and_salt,
+    ).map_err(|e| format!("Failed to decrypt vote: {}", e))?;
+
+    // Decode the vote+salt
+    let vote_and_salt = CorevoVoteAndSalt::decode(&mut decrypted.as_slice())
+        .map_err(|e| format!("Failed to decode vote: {}", e))?;
+
+    // Connect to chain
+    let client = ChainClient::connect(chain_url)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Send the RevealOneTimeSalt message
+    let reveal_msg = CorevoMessage::RevealOneTimeSalt(vote_and_salt.onetime_salt);
+    let reveal_remark = PrefixedCorevoRemark::from(CorevoRemark::V1(CorevoRemarkV1 {
+        context,
+        msg: reveal_msg,
+    }));
+
+    client.send_remark(&account.sr25519_keypair, reveal_remark)
+        .await
+        .map_err(|e| format!("Failed to reveal vote: {}", e))?;
+
+    Ok(())
+}
+
+/// Async function to announce X25519 public key on chain
+async fn announce_pubkey(
+    chain_url: &str,
+    secret_uri: &str,
+) -> Result<(), String> {
+    use corevo_lib::{
+        ChainClient, CorevoContext, CorevoMessage, CorevoRemark, CorevoRemarkV1,
+        PrefixedCorevoRemark, derive_account_from_uri,
+    };
+
+    // Derive account for signing
+    let account = derive_account_from_uri(secret_uri)
+        .map_err(|e| e.to_string())?;
+
+    // Connect to chain
+    let client = ChainClient::connect(chain_url)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // Create the announce message with empty string context (global announcement)
+    let pubkey_bytes: [u8; 32] = account.x25519_public.to_bytes();
+    let announce_msg = CorevoMessage::AnnounceOwnPubKey(pubkey_bytes);
+    let announce_remark = PrefixedCorevoRemark::from(CorevoRemark::V1(CorevoRemarkV1 {
+        context: CorevoContext::String(String::new()),
+        msg: announce_msg,
+    }));
+
+    client.send_remark(&account.sr25519_keypair, announce_remark)
+        .await
+        .map_err(|e| format!("Failed to announce pubkey: {}", e))?;
 
     Ok(())
 }

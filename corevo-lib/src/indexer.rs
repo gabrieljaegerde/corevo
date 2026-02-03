@@ -265,11 +265,13 @@ impl HistoryQuery {
             }
         }
 
-        // Phase 2: Decrypt common salts using proposer secrets
+        // Phase 2: Decrypt common salts using known account secrets
         for (_context, config) in context_configs.iter_mut() {
+            let mut seen_salts: HashSet<[u8; 32]> = HashSet::new();
             let proposer_key = HashableAccountId(config.proposer.clone());
+
+            // Method 1: If we have the proposer's secret, decrypt all invites
             if let Some(proposer_secret) = known_secrets.get(&proposer_key) {
-                let mut seen_salts: HashSet<[u8; 32]> = HashSet::new();
                 for (voter, encrypted_salts) in config.encrypted_common_salts.iter() {
                     let voter_pubkey = voter_pubkeys
                         .get(voter)
@@ -280,6 +282,34 @@ impl HistoryQuery {
                         for encrypted_salt in encrypted_salts {
                             if let Ok(decrypted) =
                                 decrypt_from_sender(proposer_secret, &voter_pub, encrypted_salt)
+                            {
+                                if decrypted.len() == 32 {
+                                    let mut salt = [0u8; 32];
+                                    salt.copy_from_slice(&decrypted);
+                                    if seen_salts.insert(salt) {
+                                        config.common_salts.push(salt);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Method 2: If we have a voter's secret, decrypt their own invite
+            // (works even if we're not the proposer)
+            let proposer_pubkey = voter_pubkeys
+                .get(&proposer_key)
+                .map(|pk| X25519PublicKey::from(*pk));
+
+            if let Some(proposer_pub) = proposer_pubkey {
+                for (voter, encrypted_salts) in config.encrypted_common_salts.iter() {
+                    // Check if we have this voter's secret
+                    if let Some(voter_secret) = known_secrets.get(voter) {
+                        for encrypted_salt in encrypted_salts {
+                            // Decrypt using voter's secret + proposer's public key
+                            if let Ok(decrypted) =
+                                decrypt_from_sender(voter_secret, &proposer_pub, encrypted_salt)
                             {
                                 if decrypted.len() == 32 {
                                     let mut salt = [0u8; 32];

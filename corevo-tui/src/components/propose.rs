@@ -95,11 +95,11 @@ impl ProposeComponent {
                             let address = format_account_ss58(&voter.account_id.0, ss58_prefix);
 
                             let style = if is_focused {
-                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
                             } else if voter.selected {
-                                Style::default().fg(Color::Green)
+                                Style::default().fg(Color::Green).add_modifier(Modifier::UNDERLINED)
                             } else {
-                                Style::default()
+                                Style::default().add_modifier(Modifier::UNDERLINED)
                             };
 
                             let prefix = if is_focused { "> " } else { "  " };

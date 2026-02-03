@@ -32,3 +32,9 @@ arboard = "3"
 # Crypto (for proposer functionality)
 rand.workspace = true
 x25519-dalek.workspace = true
+
+# Encoding (for voting)
+codec.workspace = true
+
+# Database (for reveal query)
+mongodb.workspace = true
