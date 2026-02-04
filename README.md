@@ -119,8 +119,6 @@ This allows for fine-grained filtering in our queries as we prefix each remark w
 example litescan mongodb query:
 `{method: "remark", "args.remark": { $regex: /^0xcc00ee/i }}`
 
-TODO: mongodb query in cli and counting all votes.
-
 Install mongosh
 ```
 curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc |    sudo gpg -o /usr/share/keyrings/mongodb-server-7.0.gpg    --dearmor
